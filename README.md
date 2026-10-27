@@ -2,6 +2,8 @@
 
 A small router and runner for coding agents. It reads a task, picks which agent should do it (Codex, Claude or Gemini through `agy`) and how much reasoning it needs, builds the change on its own git branch, has a different model family review it, and merges only when it is safe.
 
+**Watch the 2-minute walkthrough:** [docs/walkthrough.mp4](docs/walkthrough.mp4) (720p, with subtitles).
+
 This is the agent part of my personal assistant system, Andy. I use it every day on my own repos. The version here is a copy of the routing and run code with my private integrations (Notion reporting, vault sync, my labelled task sets) removed.
 
 ## What It Does
