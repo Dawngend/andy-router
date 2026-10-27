@@ -41,7 +41,7 @@ size: small
 Make greet() return "Hello, <name>!" and add a test.
 ```
 
-Optional header fields are `tool` (codex, claude, agy), `tier` (low, mid, high), `effort` and `scope` (comma-separated path prefixes the builder may change). If a spec names both tool and tier, routing is skipped. See `examples/example_spec.md`.
+Optional header fields are `tool` (codex, claude, agy, opencode), `tier` (low, mid, high), `effort` and `scope` (comma-separated path prefixes the builder may change). If a spec names both tool and tier, routing is skipped. See `examples/example_spec.md`.
 
 ## Run It
 
@@ -53,6 +53,27 @@ python andy_run.py examples/example_spec.md             # the real run
 ```
 
 Laya is optional. To turn it on, run `npm install` inside `laya/` (it uses `@receptron/laya`).
+
+## Switches
+
+- **OpenCode builder.** `tool: opencode` in a spec header runs a free model. Routing never picks it by itself. Set `ANDY_NO_OPENCODE_REPOS` to a list of paths it must not build in.
+- **Builder mode.** A small file forces every build onto one model family until a set time, and reviewers skip the family being saved.
+- **Save-Claude.** A small file holds a time. Until then Claude is kept for chat and planning, so builds go to Codex and reviews to Gemini.
+- **Tool cooldown.** A builder that hits a spend cap or usage limit is benched for five hours and the run falls back to another tool.
+
+The files live in `~/.andy_sync`, or in the folder named by `ANDY_STATE_DIR`. Details are in `docs/FEATURES.md`, and what was left out of this copy is in `docs/NOT_INCLUDED.md`.
+
+## Results
+
+These numbers come from my own run reports, 166 runs in October 2026, counted by `benchmark/run_stats.py`. Full tables are in `docs/BENCHMARK.md`.
+
+| Outcome | Runs |
+| --- | --- |
+| Merged | 50 |
+| Stopped for a human | 99 |
+| Failed | 17 |
+
+Merge rate by builder: Codex 36.8% of 95 runs, Claude 28.3% of 46, OpenCode 14.3% of 14. Agy was used for 11 runs and none merged. These rates mix spec sizes, and big or high-tier specs always stop for a human, so they say more about how I use the router than about how good each tool is. Regenerate the tables from your own reports with `python benchmark/run_stats.py`.
 
 ## Tests
 
@@ -73,6 +94,9 @@ The 200+ tests mock every CLI, git call and network call, so they run offline. T
 | `llm_router.py` | Asks Gemini Flash for a tool and tier using labelled examples |
 | `laya_router.py`, `laya/` | Calls Laya through Node and validates its output |
 | `secret_scan.py` | Flags lines that look like keys or tokens in a diff |
+| `tool_cooldown.py` | Benches a builder tool after a spend-cap or usage-limit failure |
+| `run_tree.py` | Kills the whole process tree when a call times out |
+| `benchmark/run_stats.py` | Turns the run reports into the aggregate tables in `docs/BENCHMARK.md` |
 | `laya/eval_router.py` | Scores the router on a labelled task set |
 
 ## Notes
