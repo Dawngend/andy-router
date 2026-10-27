@@ -73,10 +73,12 @@ def harness(tmp_path, monkeypatch):
     route = Mock(return_value=assess_task("fix greeting", use_laya=False))
     notion = Mock(return_value="notion-page")
     monkeypatch.setattr(andy_run.subprocess, "run", run)
-    monkeypatch.setattr(andy_run.shutil, "which", lambda tool: f"C:/Program Files/{tool}.cmd")
+    monkeypatch.setattr(andy_run.shutil, "which", lambda tool: None if tool in state.get("missing_tools", ())
+                        else f"C:/Program Files/{tool}.cmd")
     monkeypatch.setattr(andy_run, "assess_task", route)
     monkeypatch.setattr(andy_run, "ask_laya", Mock(return_value=None))
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    monkeypatch.setenv("ANDY_STATE_DIR", str(tmp_path / "home/.andy_sync"))
     options = {"clock": lambda: datetime(2026, 10, 5), "notion": notion}
 
     def execute(*extra):
@@ -92,6 +94,28 @@ def harness(tmp_path, monkeypatch):
 def git_calls(calls, name):
     return [(command, kwargs) for command, kwargs in calls
             if isinstance(command, list) and command[:2] == ["git", name]]
+
+
+@pytest.mark.parametrize("pinned,expected", [("claude", "agy"), ("opencode", "opencode")])
+def test_builder_mode_overrides_header_except_opencode(harness, pinned, expected, monkeypatch, tmp_path):
+    state, calls, route, notion, spec, execute, report = harness
+    monkeypatch.setattr(andy_run.tempfile, "tempdir", str(tmp_path))
+    switch = andy_run.state_dir() / "builder_mode"
+    switch.parent.mkdir(parents=True)
+    switch.write_text("gemini")
+    spec.write_text(spec.read_text().replace(
+        "check: python -m pytest\n", f"check: python -m pytest\ntool: {pinned}\n"))
+    assert execute() == 0
+    assert report()["route"]["tool"] == expected
+
+
+def test_main_reads_cooldown_before_building(harness):
+    import tool_cooldown
+
+    state, calls, route, notion, spec, execute, report = harness
+    tool_cooldown.record_cooldown(andy_run.state_dir() / "tool_cooldown.json", "codex", datetime(2026, 10, 5))
+    assert execute() == 0
+    assert report()["route"]["tool"] == "claude"
 
 
 def test_hijack_stops_before_build(harness, monkeypatch):
@@ -295,6 +319,7 @@ def test_dry_run_prints_scope_when_set(harness, capsys):
 ])
 def test_reviewer_family_and_cli_contract(harness, tool, tier, reviewer, model):
     state, calls, route, notion, spec, execute, report = harness
+    state["missing_tools"] = {"agy"}
     route.return_value = replace(route.return_value, tool=tool, tier=tier)
     spec.write_text(spec.read_text() + '\nSay "hello" and \'welcome\'.\n')
     assert execute() == (3 if tier is Tier.HIGH else 0)
@@ -670,6 +695,7 @@ def test_spec_header_pins_tool_and_tier_and_skips_routing(harness):
 ])
 def test_effort_reaches_builder_and_reviewer(harness, capsys, builder, reviewer):
     state, calls, route, notion, spec, execute, report = harness
+    state["missing_tools"] = {"agy"}
     spec.write_text(spec.read_text().replace("check: python -m pytest\n",
                                              f"check: python -m pytest\ntool: {builder.value}\ntier: mid\neffort: high\n"))
     assert execute() == 0
@@ -726,6 +752,7 @@ def test_max_maps_to_xhigh_for_codex(harness, capsys):
 
 def test_max_maps_for_codex_reviewer_but_claude_keeps_max(harness, capsys):
     state, calls, route, notion, spec, execute, report = harness
+    state["missing_tools"] = {"agy"}
     spec.write_text(spec.read_text().replace("check: python -m pytest\n",
                                              "check: python -m pytest\ntool: claude\ntier: mid\neffort: max\n"))
     assert execute() == 0
@@ -830,6 +857,7 @@ def test_codex_builder_retries_capacity_and_records_used_model(harness):
 
 def test_codex_reviewer_retries_capacity_and_records_used_model(harness):
     state, calls, route, notion, spec, execute, report = harness
+    state["missing_tools"] = {"agy"}
     route.return_value = replace(route.return_value, tool=Tool.CLAUDE)
     state["capacity"] = {"gpt-6-sol": 1, "gpt-6-astra": 1}
 
