@@ -28,6 +28,7 @@ class Tool(str, Enum):
     AGY = "agy"
     CODEX = "codex"
     CLAUDE = "claude"
+    OPENCODE = "opencode"
 
 
 class TaskType(str, Enum):
@@ -199,6 +200,13 @@ _MODEL_LADDERS: dict[Tool, dict[Tier, str]] = {
         Tier.LOW: "haiku",
         Tier.MID: "sonnet",
         Tier.HIGH: "opus",
+    },
+    Tool.OPENCODE: {
+        # Reachable only through a spec header (never by routing rules or Laya): a free
+        # model, so a build on it costs nothing.
+        Tier.LOW: "opencode/deepseek-v4.1-flash-free",
+        Tier.MID: "opencode/deepseek-v4.1-flash-free",
+        Tier.HIGH: "opencode/deepseek-v4.1-flash-free",
     },
 }
 _HIGH_RISK_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (

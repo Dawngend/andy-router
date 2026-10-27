@@ -20,11 +20,11 @@ def test_parse_reads_two_words_and_rejects_junk():
 
 def test_route_with_llm_runs_in_an_empty_folder_and_survives_failure(tmp_path):
     with patch("llm_router.shutil.which", return_value="C:/bin/agy.exe"), \
-         patch("llm_router.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "claude low", "")) as run:
+         patch("llm_router.run_with_tree_kill", return_value=subprocess.CompletedProcess([], 0, "claude low", "")) as run:
         assert llm_router.route_with_llm("explain git") == ("claude", "low")
     assert run.call_args.kwargs["cwd"] != "/some/other/dir"
     with patch("llm_router.shutil.which", return_value="C:/bin/agy.exe"), \
-         patch("llm_router.subprocess.run", side_effect=subprocess.TimeoutExpired("agy", 1)):
+         patch("llm_router.run_with_tree_kill", side_effect=subprocess.TimeoutExpired("agy", 1)):
         assert llm_router.route_with_llm("explain git") is None
     with patch("llm_router.shutil.which", return_value=None):
         assert llm_router.route_with_llm("explain git") is None

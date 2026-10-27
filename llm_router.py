@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import tempfile
 
+from run_tree import run_with_tree_kill
+
 MODEL = "gemini-3.8-flash-high"
 EXAMPLES = Path(__file__).with_name("laya") / "eval_tasks.json"
 RULES = """You route tasks for Dawn's assistant system. Answer with exactly two words: TOOL TIER.
@@ -46,8 +48,8 @@ def route_with_llm(task, *, timeout=120):
     try:
         # An empty working folder: agy is an agent, so it must have nothing to act on.
         with tempfile.TemporaryDirectory() as empty:
-            result = subprocess.run([agy, "--model", MODEL, "-p", prompt], cwd=empty, capture_output=True,
-                                    text=True, timeout=timeout, check=False)
+            result = run_with_tree_kill([agy, "--model", MODEL, "-p", prompt], cwd=empty,
+                                        text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
     return parse(result.stdout) if result.returncode == 0 else None

@@ -10,16 +10,23 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import tokenize
+
+import tool_cooldown
 
 from secret_scan import scan_secret_content
 from laya_router import ask_laya
-from tier_router import Tier, Tool, _HIGH_RISK_PATTERNS, assess_task, select_model
+from tier_router import Tier, Tool, _HIGH_RISK_PATTERNS, _is_within_dir, assess_task, select_model
 
 
 REPLY_RULE = "First answer each finding with AGREE or DISAGREE and one reason, then fix only what you agree with."
 BUILD_RULES = "Work only in this worktree. Do not push or merge. Keep code simple."
 CODEX_FALLBACK = ("gpt-6-luna", "gpt-6-sol", "gpt-6-astra", "gpt-5.6-terra")
+
+
+def state_dir():
+    return Path(os.environ["ANDY_STATE_DIR"]) if "ANDY_STATE_DIR" in os.environ else Path.home() / ".andy_sync"
 
 
 def read_spec(path):
@@ -41,8 +48,8 @@ def read_spec(path):
     header.setdefault("size", "small")
     if header["size"] not in {"small", "big"}:
         raise ValueError("Spec size must be small or big")
-    if header.get("tool", "codex") not in {"codex", "claude", "agy"} or header.get("tier", "mid") not in {"low", "mid", "high"}:
-        raise ValueError("Spec tool must be codex, claude or agy and tier low, mid or high")
+    if header.get("tool", "codex") not in {"codex", "claude", "agy", "opencode"} or header.get("tier", "mid") not in {"low", "mid", "high"}:
+        raise ValueError("Spec tool must be codex, claude, agy or opencode and tier low, mid or high")
     if "effort" in header and header["effort"] not in {"low", "medium", "high", "xhigh", "max"}:
         raise ValueError("Spec effort must be low, medium, high, xhigh or max")
     if "scope" in header and (not header["scope"] or any(
@@ -53,6 +60,11 @@ def read_spec(path):
         raise ValueError("Spec scope must contain repo-relative path prefixes with forward slashes")
     repo = Path(header["repo"]).expanduser()
     header["repo"] = (path.parent / repo).resolve()
+    if header.get("tool") == "opencode" and any(
+        _is_within_dir(header["repo"], Path(repo))
+        for repo in os.environ.get("ANDY_NO_OPENCODE_REPOS", "").split(os.pathsep) if repo
+    ):
+        raise ValueError("opencode is blocked for this repo; use codex or claude")
     return header, text
 
 
@@ -64,7 +76,7 @@ class NoReviewer(RuntimeError):
 
 
 def effort_for(tool, effort):
-    if tool is Tool.AGY:
+    if tool in (Tool.AGY, Tool.OPENCODE):
         return None
     return "xhigh" if tool is Tool.CODEX and effort == "max" else effort
 
@@ -85,6 +97,14 @@ def agent_command(tool, model, worktree, *, review=False, which=shutil.which, pr
         if len(prompt) > AGY_PROMPT_LIMIT:
             raise ValueError(f"prompt too long for agy ({len(prompt)} characters)")
         return [executable, "--model", model, "-p", prompt]
+    if tool is Tool.OPENCODE:
+        # opencode is a .cmd shim; cmd.exe mangles a long multi-line argument, so the prompt
+        # travels as a file instead, written outside the worktree sandbox.
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as handle:
+            handle.write(prompt)
+            prompt_path = handle.name
+        return [executable, "run", "Follow the attached task file exactly. Work only in this directory.",
+                "-m", model, "--dir", str(worktree), "--auto", "-f", prompt_path]
     command = [executable, "-p", "--model", model]
     if effort:
         command.extend(["--effort", effort_for(tool, effort)])
@@ -95,7 +115,24 @@ def agent_command(tool, model, worktree, *, review=False, which=shutil.which, pr
 
 
 def stdin_for(tool, prompt):
+    # OpenCode reads the prompt from its -f file, so it gets closed stdin instead of the parent's.
+    if tool is Tool.OPENCODE:
+        return ""
     return None if tool is Tool.AGY else prompt
+
+
+_SWITCH_WARNED = set()
+
+
+def read_switch(path):
+    """Read a switch file; an undecodable (for example UTF-16) file counts as off."""
+    try:
+        return path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        if path not in _SWITCH_WARNED:
+            _SWITCH_WARNED.add(path)
+            print(f"Ignoring {path}: switch file is not UTF-8 text")
+        return None
 
 
 def save_claude(now=None):
@@ -104,32 +141,94 @@ def save_claude(now=None):
     Claude writes the weekly reset time (ISO 8601) into the file when it turns the switch on; after that
     time the switch counts as off by itself. An empty file means on until removed.
     """
-    path = Path.home() / ".andy_sync" / "save_claude"
+    path = state_dir() / "save_claude"
     if not path.exists():
         return False
-    text = path.read_text(encoding="utf-8").strip()
+    text = read_switch(path)
+    if text is None:
+        return False
+    lines = text.splitlines()
+    text = lines[0].strip().lower() if lines else ""
     if not text:
         return True
     try:
-        resets_at = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        resets_at = datetime.fromisoformat(text.replace("z", "+00:00"))
     except ValueError:
         return True
     return (now or datetime.now(resets_at.tzinfo)) < resets_at
 
 
-def reviewers_for(route):
+MODE_TOOLS = {"claude": Tool.CLAUDE, "codex": Tool.CODEX, "gemini": Tool.AGY}
+
+
+def builder_mode(now=None):
+    """Dawn's switch to force one builder family for a stretch of time (`andy mode`).
+
+    Line 1 names the family: claude, codex or gemini (gemini means the agy tool). An optional
+    line 2 is an ISO reset time; after it the mode counts as off, same as save_claude. A missing
+    file, empty file, or an unknown word on line 1 means off (None).
+    """
+    path = state_dir() / "builder_mode"
+    if not path.exists():
+        return None
+    text = read_switch(path)
+    if text is None:
+        return None
+    lines = text.splitlines()
+    tool = MODE_TOOLS.get(lines[0].strip().lower() if lines else "")
+    if tool is None:
+        return None
+    if len(lines) > 1 and lines[1].strip():
+        try:
+            resets_at = datetime.fromisoformat(lines[1].strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        current = now or datetime.now(resets_at.tzinfo)
+        if resets_at.tzinfo is not None and current.tzinfo is None:
+            current = current.astimezone()
+        elif resets_at.tzinfo is None and current.tzinfo is not None:
+            current = current.astimezone().replace(tzinfo=None)
+        if current >= resets_at:
+            return None
+    return tool
+
+
+def saved_family(mode):
+    # The family Dawn is saving by forcing the other one to build: codex mode saves Claude;
+    # claude or gemini mode saves Codex.
+    return Tool.CLAUDE if mode is Tool.CODEX else Tool.CODEX
+
+
+def reviewers_for(route, *, plan_check=False):
     # With save-Claude on, a separate read-only Codex run follows AGY for Codex builds.
     agy = (Tool.AGY, "gemini-3.8-flash-high")
+    claude_model = "opus" if route.tier is Tier.HIGH else "sonnet"
     if route.tool is Tool.CODEX:
-        reviewers = [(Tool.CLAUDE, "opus" if route.tier is Tier.HIGH else "sonnet"), agy]
+        reviewers = [(Tool.CLAUDE, claude_model), agy]
         if save_claude():
-            return [agy, (Tool.CODEX, "gpt-6-sol"), reviewers[0]]
+            reviewers = [agy, (Tool.CODEX, "gpt-6-sol"), reviewers[0]]
     elif route.tool is Tool.CLAUDE:
-        reviewers = [(Tool.CODEX, "gpt-6-sol"), agy]
+        reviewers = ([(Tool.CODEX, "gpt-6-sol"), agy] if plan_check
+                     else [agy, (Tool.CODEX, "gpt-6-sol")])
+    elif route.tool is Tool.OPENCODE:
+        # Never Codex first, never OpenCode reviewing itself.
+        reviewers = [agy, (Tool.CLAUDE, claude_model)]
     else:
-        reviewers = [(Tool.CODEX, "gpt-6-sol"), (Tool.CLAUDE, "sonnet")]
+        reviewers = [(Tool.CODEX, "gpt-6-sol"), (Tool.CLAUDE, claude_model)]
     if save_claude():
         reviewers.sort(key=lambda reviewer: reviewer[0] is Tool.CLAUDE)
+    try:
+        cooldowns = tool_cooldown.load_cooldowns(
+            state_dir() / "tool_cooldown.json", datetime.now())
+    except Exception as exc:
+        print(f"tool cooldown file unreadable, ignoring cooldowns: {exc}")
+        cooldowns = {}
+    filtered = [reviewer for reviewer in reviewers if reviewer[0].value not in cooldowns]
+    reviewers = filtered or reviewers
+    mode = builder_mode()
+    if mode is not None:
+        filtered = [reviewer for reviewer in reviewers if reviewer[0] is not saved_family(mode)]
+        reviewers = filtered or reviewers
     return reviewers
 
 
@@ -152,7 +251,11 @@ def call_agent(tool, model, worktree, prompt, runner, which, *, review=False, re
     for used_model in models:
         command = agent_command(tool, used_model, worktree, review=review, which=which, prompt=prompt,
                                 effort=effort)
-        result = call(command, worktree, runner, required=False, input=stdin_for(tool, prompt))
+        try:
+            result = call(command, worktree, runner, required=False, input=stdin_for(tool, prompt))
+        finally:
+            if tool is Tool.OPENCODE:
+                Path(command[command.index("-f") + 1]).unlink(missing_ok=True)
         output = (result.stdout or "") + (result.stderr or "")
         if result.returncode == 0 or "Selected model is at capacity" not in output:
             break
@@ -160,6 +263,18 @@ def call_agent(tool, model, worktree, prompt, runner, which, *, review=False, re
         raise RuntimeError(f"Command failed ({result.returncode}): {tool.value}/{used_model}\n"
                            f"{result.stderr or result.stdout or ''}")
     return result, used_model
+
+
+def cooldown_fallback(route, cooldowns, *, exclude=None):
+    if route.tool.value not in cooldowns:
+        return route
+    capped_tool = route.tool
+    for fallback in (Tool.CLAUDE, Tool.AGY):
+        if fallback is not capped_tool and fallback.value not in cooldowns and fallback is not exclude:
+            return replace(route, tool=fallback, model=select_model(fallback, route.tier).model,
+                           reasons=(*route.reasons,
+                                    f"{capped_tool.value} in cooldown (spend cap/usage limit) -> {fallback.value}"))
+    return route
 
 
 def git(args, cwd, runner, *, required=True):
@@ -193,6 +308,9 @@ def same_failed_check(previous, current):
 def diagnose_stuck(route, worktree, spec, diff, previous, current, runner, which):
     tool, model = ((Tool.CLAUDE, "opus") if route.tool in {Tool.CODEX, Tool.AGY} and not save_claude()
                    else (Tool.CODEX, "gpt-6-sol"))
+    mode = builder_mode()
+    if mode is not None and tool is saved_family(mode):
+        tool, model = (Tool.CODEX, "gpt-6-sol") if tool is Tool.CLAUDE else (Tool.CLAUDE, "opus")
     prompt = (f"SPEC:\n{spec}\nDIFF:\n{diff}\nPREVIOUS CHECK TAIL:\n{previous}\n"
               f"LATEST CHECK TAIL:\n{current}\n"
               "In at most 10 lines, say the root cause and the one change that would fix it. Plain text, no edits.")
@@ -246,9 +364,9 @@ def plan_check_prompt(text):
             '{"pass": true, "findings": [{"severity": "high|low", "text": "...", "fix": "..."}]}')
 
 
-def run_review(route, worktree, prompt, runner, which, effort=None):
+def run_review(route, worktree, prompt, runner, which, effort=None, *, plan_check=False):
     failures = []
-    for tool, model in reviewers_for(route):
+    for tool, model in reviewers_for(route, plan_check=plan_check):
         try:
             result, used_model = call_agent(tool, model, worktree, prompt, runner, which,
                                             review=True, required=False, effort=effort)
@@ -264,9 +382,15 @@ def run_review(route, worktree, prompt, runner, which, effort=None):
     raise NoReviewer("No reviewer available: " + " | ".join(failures))
 
 
-def build_round(number, prompt, text, header, route, worktree, branch, runner, which):
-    built, builder_model = call_agent(route.tool, route.model, worktree, prompt, runner, which,
-                                      effort=header.get("effort"))
+def build_round(number, prompt, text, header, route, worktree, branch, runner, which, *,
+                clock=datetime.now, cooldown_path=None):
+    try:
+        built, builder_model = call_agent(route.tool, route.model, worktree, prompt, runner, which,
+                                          effort=header.get("effort"))
+    except RuntimeError as exc:
+        if cooldown_path is not None and tool_cooldown.is_cap_failure(str(exc)):
+            tool_cooldown.record_cooldown(cooldown_path, route.tool.value, clock())
+        raise
     git(["add", "-A"], worktree, runner)
     # A builder may have made no edits (or committed them itself).
     staged = git(["diff", "--cached", "--quiet"], worktree, runner, required=False)
@@ -416,7 +540,8 @@ def finish(report, runs_dir, notion):
     return {"merged": 0, "stopped-for-dawn": 3, "failed": 1}[report["outcome"]]
 
 
-def main(argv=None, *, runner=None, which=None, clock=None, runs_dir=None, route_task=None, notion=None):
+def main(argv=None, *, runner=None, which=None, clock=None, runs_dir=None, route_task=None, notion=None,
+         cooldown_path=None):
     parser = argparse.ArgumentParser(prog="andy run")
     parser.add_argument("spec", type=Path)
     parser.add_argument("--dry-run", action="store_true")
@@ -427,7 +552,9 @@ def main(argv=None, *, runner=None, which=None, clock=None, runs_dir=None, route
     route_task = route_task or assess_task
     if notion is None:
         notion = False  # optional hook: a callable that reports the run elsewhere and returns an id
-    runs_dir = Path(runs_dir) if runs_dir is not None else Path.home() / ".andy_sync" / "runs"
+    runs_dir = Path(runs_dir) if runs_dir is not None else state_dir() / "runs"
+    cooldown_path = (Path(cooldown_path) if cooldown_path is not None
+                     else state_dir() / "tool_cooldown.json")
     report = None
     try:
         header, text = read_spec(args.spec.resolve())
@@ -448,6 +575,14 @@ def main(argv=None, *, runner=None, which=None, clock=None, runs_dir=None, route
         if not header.get("tool") and route.tool is Tool.CLAUDE and save_claude():
             route = replace(route, tool=Tool.CODEX, model=select_model(Tool.CODEX, route.tier).model)
             print("save-Claude on: builder claude -> codex")
+        cooldowns = tool_cooldown.load_cooldowns(cooldown_path, clock())
+        route = cooldown_fallback(route, cooldowns)
+        mode = builder_mode(clock())
+        if mode is not None and route.tool is not Tool.OPENCODE:
+            route = replace(route, tool=mode, model=select_model(mode, route.tier).model,
+                            reasons=(*route.reasons, f"builder mode: {mode.value}"))
+            print(f"Builder mode: {mode.value}")
+            route = cooldown_fallback(route, cooldowns, exclude=saved_family(mode))
         requested_effort = header.get("effort")
         chosen_effort = effort_for(route.tool, requested_effort)
         if requested_effort == "max" and (route.tool is Tool.CODEX or
@@ -460,12 +595,17 @@ def main(argv=None, *, runner=None, which=None, clock=None, runs_dir=None, route
             print(f"Scope: {header['scope']}")
         if args.dry_run:
             tool, model = reviewer_for(route)
+            builder_command = agent_command(route.tool, route.model, worktree, which=which,
+                                            effort=requested_effort)
+            review_command = agent_command(tool, model, worktree, review=True, which=which,
+                                           prompt="<review prompt>", effort=requested_effort)
             print(f"Plan check: {'yes' if header['size'] == 'big' else 'no'}")
             print(f"Worktree: {worktree}")
-            print("Builder: " + subprocess.list2cmdline(agent_command(route.tool, route.model, worktree, which=which,
-                                                                     effort=requested_effort)))
-            print("Reviewer: " + subprocess.list2cmdline(agent_command(tool, model, worktree, review=True, which=which,
-                                                                      prompt="<review prompt>", effort=requested_effort)))
+            print("Builder: " + subprocess.list2cmdline(builder_command))
+            print("Reviewer: " + subprocess.list2cmdline(review_command))
+            for command in (builder_command, review_command):
+                if "-f" in command:
+                    Path(command[command.index("-f") + 1]).unlink(missing_ok=True)
             print("Fallback reviewer: " + " ".join(f"{t.value}/{m}" for t, m in reviewers_for(route)[1:]))
             print("Dry run: rules-only route; nothing changed.")
             return 0
@@ -485,7 +625,7 @@ def main(argv=None, *, runner=None, which=None, clock=None, runs_dir=None, route
         if header["size"] == "big":
             try:
                 reviewer, review = run_review(route, repo, plan_check_prompt(text), runner, which,
-                                              effort=header.get("effort"))
+                                              effort=header.get("effort"), plan_check=True)
                 report["plan_check"] = {"reviewer": reviewer, "review": review}
                 findings = review["findings"]
                 high_findings = [item for item in findings if item["severity"] == "high"]
@@ -511,7 +651,8 @@ def main(argv=None, *, runner=None, which=None, clock=None, runs_dir=None, route
         diff = ""
         stuck = False
         for number in range(1, 4):
-            result, diff = build_round(number, prompt, text, header, route, worktree, branch, runner, which)
+            result, diff = build_round(number, prompt, text, header, route, worktree, branch, runner, which,
+                                       clock=clock, cooldown_path=cooldown_path)
             report["rounds"].append(result)
             if result["pass"]:
                 break
