@@ -114,7 +114,8 @@ def test_summarize_writes_counts_and_tables(tmp_path):
     assert "| claude | 3 | 3 |" in text
     assert "| agy | 1 | 0 |" in text
     assert "| opencode | 1 | 1 |" in text
-    assert "| other | 4 | 2 |" in text
+    assert "| gateway | 1 | 0 |" in text
+    assert "| other | 3 | 2 |" in text
     assert "| big spec | 1 |" in text
     assert "| high tier | 1 |" in text
     assert "| repeated check failure | 1 |" in text
@@ -126,7 +127,8 @@ def test_summarize_writes_counts_and_tables(tmp_path):
     assert "| plan check findings | 1 |" in text
     assert "| hijack suspicion | 1 |" in text
     assert "| risk pattern in spec text | 1 |" in text
-    assert "| other | 2 |" in text
+    assert "| tool command failed | 1 |" in text
+    assert "| other | 1 |" in text
 
 
 def test_summarize_does_not_leak_task_text_or_paths(tmp_path):

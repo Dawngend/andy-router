@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
 from andy_run import _HIGH_RISK_PATTERNS
 
 
-FAMILIES = ("codex", "claude", "agy", "opencode", "other")
+FAMILIES = ("codex", "claude", "agy", "opencode", "gateway", "other")
 OUTCOMES = ("merged", "stopped-for-dawn", "failed")
 ROUND_BUCKETS = (0, 1, 2, 3)
 RISK_LABELS = {reason for _, reason in _HIGH_RISK_PATTERNS}
@@ -30,6 +30,9 @@ STOP_CATEGORIES = (
     "plan check findings",
     "hijack suspicion",
     "risk pattern in spec text",
+    "no reviewer available",
+    "tool command failed",
+    "no changes",
     "other",
 )
 STOP_PREFIXES = (
@@ -47,6 +50,9 @@ STOP_PREFIXES = (
     ("Post-merge check failed", "merge problem"),
     ("plan check:", "plan check findings"),
     ("spec text looks like an instruction hijack", "hijack suspicion"),
+    ("No reviewer available", "no reviewer available"),
+    ("Command failed", "tool command failed"),
+    ("no changes", "no changes"),
 )
 
 
